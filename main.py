@@ -1,86 +1,121 @@
-from ctypes import *
-from contextlib import contextmanager
 import openai
-import pyttsx3
+import asyncio
+import re
+import whisper
+import boto3
+import pydub
+from pydub import playback
 import speech_recognition as sr
-import time
-import pyaudio
+import EdgeGPT
 
-ERROR_HANDLER_FUNC = CFUNCTYPE(None, c_char_p, c_int, c_char_p, c_int, c_char_p)
+# Initialize the OpenAI API
+openai.api_key = "[paste your OpenAI API key here]"
 
-def py_error_handler(filename, line, function, err, fmt):
-    pass
+# Create a recognizer object and wake word variables
+recognizer = sr.Recognizer()
+BING_WAKE_WORD = "hey boss"
+GPT_WAKE_WORD = "gpt"
 
-c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
-
-@contextmanager
-def noalsaerr():
-    asound = cdll.LoadLibrary('libasound.so')
-    asound.snd_lib_error_set_handler(c_error_handler)
-    yield
-    asound.snd_lib_error_set_handler(None)
-
-with noalsaerr():
-    p = pyaudio.PyAudio()
-stream = p.open(format=pyaudio.paFloat32, channels=1, rate=44100, output=1)
-
-
-openai.api_key = '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'
-engine = pyttsx3.init()
-
-def audio_to_text(filename):
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(filename) as source:
-        audio = recognizer.record(source)
-    try:
-        return recognizer.recognize_google(audio)
-    except:
-        print('Skipping unknown error')
-
-def generate_response(prompt):
-    response = openai.Completion.create(
-        engine="text-davinci-003",
-        prompt=prompt,
-        max_tokens=4000,
-        n=1,
-        stop=None,
-        temperature=0.5,
+def get_wake_word(phrase):
+    if BING_WAKE_WORD in phrase.lower():
+        return BING_WAKE_WORD
+    elif GPT_WAKE_WORD in phrase.lower():
+        return GPT_WAKE_WORD
+    else:
+        return None
+    
+def synthesize_speech(text, output_filename):
+    polly = boto3.client('polly', region_name='us-west-2')
+    response = polly.synthesize_speech(
+        Text=text,
+        OutputFormat='mp3',
+        VoiceId='Salli',
+        Engine='neural'
     )
-    return response['choices'][0]['text']
 
-def speak_text(text):
-    engine.say(text)
-    engine.runAndWait()
+    with open(output_filename, 'wb') as f:
+        f.write(response['AudioStream'].read())
 
-def main():
+def play_audio(file):
+    sound = pydub.AudioSegment.from_file(file, format="mp3")
+    playback.play(sound)
+
+async def main():
     while True:
 
-        print('Say Boss')
         with sr.Microphone() as source:
-            recognizer = sr.Recognizer()
+            recognizer.adjust_for_ambient_noise(source)
+            print(f"Waiting for wake words 'ok bing' or 'ok chat'...")
+            while True:
+                audio = recognizer.listen(source)
+                try:
+                    with open("audio.wav", "wb") as f:
+                        f.write(audio.get_wav_data())
+                    # Use the preloaded tiny_model
+                    model = whisper.load_model("base.en")
+                    result = model.transcribe("audio.wav")
+                    phrase = result["text"]
+                    print(f"You said: {phrase}")
+
+                    wake_word = get_wake_word(phrase)
+                    if wake_word is not None:
+                        break
+                    else:
+                        print("Not a wake word. Try again.")
+                except Exception as e:
+                    print("Error transcribing audio: {0}".format(e))
+                    continue
+
+            print("Speak a prompt...")
+            synthesize_speech('What can I help you with?', 'response.mp3')
+            play_audio('response.mp3')
             audio = recognizer.listen(source)
+
             try:
-                transcription = recognizer.recognize_google(audio)
-                if transcription.lower() == 'genius':
-                    filename = 'input.wav'
-                    print('say your thing...')
-                    with sr.Microphone() as source:
-                        recognizer = sr.Recognizer()
-                        source.pause_threshold = 1
-                        audio = recognizer.listen(source, phrase_time_limit=None, timeout=None)
-                        with open(filename, 'wb') as f:
-                            f.write(audio.get_wav_data())
-
-                    text = audio_to_text(filename)
-                    if text:
-                        print(f'You: {text}')
-
-                        repsonse = generate_response(text)
-
-                        speak_text(repsonse)
-            
+                with open("audio_prompt.wav", "wb") as f:
+                    f.write(audio.get_wav_data())
+                model = whisper.load_model("base")
+                result = model.transcribe("audio_prompt.wav")
+                user_input = result["text"]
+                print(f"You said: {user_input}")
             except Exception as e:
-                print('An error occured: {}'.format(e))
+                print("Error transcribing audio: {0}".format(e))
+                continue
+
+            if wake_word == BING_WAKE_WORD:
+                bot = Chatbot(cookie_path='cookies.json')
+                response = await bot.ask(prompt=user_input, conversation_style=ConversationStyle.precise)
+                # Select only the bot response from the response dictionary
+                for message in response["item"]["messages"]:
+                    if message["author"] == "bot":
+                        bot_response = message["text"]
+                # Remove [^#^] citations in response
+                bot_response = re.sub('\[\^\d+\^\]', '', bot_response)
+
+            """else:
+                # Send prompt to GPT-3.5-turbo API
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content":
+                        "You are a helpful assistant."},
+                        {"role": "user", "content": user_input},
+                    ],
+                    temperature=0.5,
+                    max_tokens=150,
+                    top_p=1,
+                    frequency_penalty=0,
+                    presence_penalty=0,
+                    n=1,
+                    stop=["\nUser:"],
+                )
+
+                bot_response = response["choices"][0]["message"]["content"]"""
+                
+        print("Bot's response:", bot_response)
+        synthesize_speech(bot_response, 'response.mp3')
+        play_audio('response.mp3')
+        await bot.close()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
